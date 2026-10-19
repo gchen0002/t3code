@@ -25,6 +25,21 @@ import { FetchHttpClient } from "effect/http";
 
 import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "./PortScanner.ts";
+import * as WindowsTcpListeners from "./WindowsTcpListeners.ts";
+
+const layerCommandPortScanner = Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
+  Layer.provide(
+    Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
+      scan: Effect.fail(
+        new WindowsTcpListeners.WindowsTcpProbeError({
+          operation: "load",
+          cause: new Error("Native API unavailable"),
+        }),
+      ),
+      processName: () => Effect.succeed(null),
+    }),
+  ),
+);
 const processProbeFailure: ProcessRunner.ProcessRunner["Service"]["run"] = (input) =>
   Effect.fail(
     new ProcessRunner.ProcessSpawnError({
@@ -62,7 +77,7 @@ const layerProbeFailure = (
     ),
   );
 
-const layerTestPortDiscovery = PortScanner.layer.pipe(
+const layerTestPortDiscovery = layerCommandPortScanner.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerNoProc,
@@ -89,7 +104,7 @@ const layerLsofScanner = (input: {
   readonly fetch: typeof globalThis.fetch;
   readonly stdout?: () => string;
 }) =>
-  PortScanner.layer.pipe(
+  layerCommandPortScanner.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerNoProc,
@@ -859,7 +874,7 @@ effectIt.effect(
       Promise.resolve(
         new Response("hello", { headers: { "content-type": "text/html" } }),
       )) as typeof globalThis.fetch;
-    const layer = PortScanner.layer.pipe(
+    const layer = layerCommandPortScanner.pipe(
       Layer.provide(
         Layer.mergeAll(
           layerNoProc,
@@ -873,8 +888,13 @@ effectIt.effect(
                 stdout: isTasklist
                   ? '"node.exe","1234","Console","1","93,164 K"\r\n'
                   : isIpv6
-                    ? "  TCP    [::1]:43123            [::]:0                 ABHÖREN         1234\r\n  TCP    [::1]:43123            [::1]:52000            HERGESTELLT     1234\r\n"
-                    : "  TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       1234\r\n  TCP    127.0.0.1:5173         127.0.0.1:60123        ESTABLISHED     9999\r\n",
+                    ? "  TCP    [::1]:43123            [::]:0                 ABHÖREN         1234\r\n  TCP    [::]:43123             [::]:0                 ABHÖREN         1234\r\n"
+                    : [
+                        "  TCP    127.0.0.1:5173         0.0.0.0:0              LISTENING       1234",
+                        "  TCP    127.0.0.1:5173         127.0.0.1:60123        ESTABLISHED     9999",
+                        "  TCP    0.0.0.0:5174           0.0.0.0:0              LISTENING       1234",
+                        "  TCP    127.0.0.1:5174         0.0.0.0:0              LISTENING       9999",
+                      ].join("\r\n"),
                 stderr: "",
                 code: failTasklist ? ChildProcessSpawner.ExitCode(1) : null,
                 timedOut: false,
@@ -901,19 +921,7 @@ effectIt.effect(
         terminalId: "scanner-terminal",
         processIds: [1234],
       });
-      const summarize = (
-        servers: ReadonlyArray<{
-          readonly port: number;
-          readonly pid: number | null;
-          readonly processName: string | null;
-        }>,
-      ) =>
-        servers.map((entry) => ({
-          port: entry.port,
-          pid: entry.pid,
-          processName: entry.processName,
-        }));
-      expect(summarize(yield* scanner.scan())).toEqual([
+      expect(yield* scanner.scan()).toMatchObject([
         { port: 5173, pid: 1234, processName: null },
         { port: 43123, pid: 1234, processName: null },
       ]);
@@ -923,7 +931,7 @@ effectIt.effect(
         ["/FO", "CSV", "/NH", "/FI", "PID eq 1234"],
       ]);
 
-      expect(summarize(yield* scanner.scan())).toEqual([
+      expect(yield* scanner.scan()).toMatchObject([
         { port: 5173, pid: 1234, processName: "node" },
         { port: 43123, pid: 1234, processName: "node" },
       ]);
@@ -942,7 +950,7 @@ effectIt.effect("ignores a partial Windows netstat snapshot when one query exits
     Promise.resolve(
       new Response("hello", { headers: { "content-type": "text/html" } }),
     )) as typeof globalThis.fetch;
-  const layer = PortScanner.layer.pipe(
+  const layer = layerCommandPortScanner.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerNoProc,
