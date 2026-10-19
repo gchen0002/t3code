@@ -15,8 +15,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
-import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import { FetchHttpClient, HttpClient } from "effect/http";
@@ -50,6 +50,10 @@ export class PortDiscovery extends Context.Service<
 >()("t3/preview/PortScanner/PortDiscovery") {}
 
 const POLL_INTERVAL = Duration.seconds(3);
+const WINDOWS_STARTUP_WINDOW_MS = 10_000;
+const WINDOWS_STARTUP_INTERVAL_MS = 1_000;
+const WINDOWS_READINESS_INITIAL_DELAY_MS = 250;
+const WINDOWS_READINESS_MAX_DELAY_MS = 2_000;
 const LSOF_TIMEOUT_MS = 5_000;
 const PROC_FD_WALK_LIMIT = 50_000;
 const SOCKET_OWNER_ATTEMPTS = 3;
@@ -92,6 +96,8 @@ interface WebProbeCacheEntry {
   readonly pid: number | null;
   readonly isWeb: boolean;
   readonly expiresAtMillis: number;
+  readonly retryUntilMillis: number;
+  readonly retryDelayMillis: number;
 }
 
 interface WebProbeGroup {
@@ -383,6 +389,8 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
   });
   const webProbeCacheRef = yield* Ref.make<ReadonlyMap<string, WebProbeCacheEntry>>(new Map());
   const scanSemaphore = yield* Semaphore.make(1);
+  const windowsWake = yield* Queue.sliding<void>(1);
+  const windowsStartupUntilRef = yield* Ref.make(0);
   const lsofMissingRef = yield* Ref.make(false);
   const windowsProcessNamesRef = yield* Ref.make<
     ReadonlyMap<number, { readonly name: string | null; readonly expiresAtMillis: number }>
@@ -551,10 +559,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     const nowMillis = yield* Clock.currentTimeMillis;
     const cached = yield* Ref.get(webProbeCacheRef);
     const groups = makeWebProbeGroups(servers, configuredUrls);
-    const batchProbes = new Map<
-      string,
-      Effect.Effect<{ readonly probe: WebProbeCacheEntry; readonly fresh: boolean }>
-    >();
+    const batchProbes = new Map<string, Effect.Effect<WebProbeCacheEntry>>();
     const batchProbeSemaphore = yield* Semaphore.make(1);
     const getProbe = (url: string, pid: number | null) => {
       const key = webProbeCacheKey(url);
@@ -569,12 +574,28 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
               cachedProbe?.pid === pid && cachedProbe.expiresAtMillis > nowMillis;
             const memoized = yield* Effect.cached(
               cachedIsCurrent
-                ? Effect.succeed({ probe: cachedProbe, fresh: false })
+                ? Effect.succeed(cachedProbe)
                 : probeWebUrl(url).pipe(
-                    Effect.map((result) => ({
-                      probe: { pid, isWeb: result !== null, expiresAtMillis: 0 },
-                      fresh: true,
-                    })),
+                    Effect.map((result) => {
+                      const previousFailure =
+                        cachedProbe?.pid === pid && !cachedProbe.isWeb ? cachedProbe : undefined;
+                      return {
+                        pid,
+                        isWeb: result !== null,
+                        expiresAtMillis: 0,
+                        retryUntilMillis:
+                          hostPlatform === "win32" && result === null
+                            ? (previousFailure?.retryUntilMillis ??
+                              nowMillis + WINDOWS_STARTUP_WINDOW_MS)
+                            : 0,
+                        retryDelayMillis: previousFailure
+                          ? Math.min(
+                              previousFailure.retryDelayMillis * 2,
+                              WINDOWS_READINESS_MAX_DELAY_MS,
+                            )
+                          : WINDOWS_READINESS_INITIAL_DELAY_MS,
+                      };
+                    }),
                   ),
             );
             batchProbes.set(identity, memoized);
@@ -587,12 +608,12 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       groups,
       (group) =>
         Effect.gen(function* () {
-          const probes: Array<readonly [string, WebProbeCacheEntry, boolean]> = [];
+          const probes: Array<readonly [string, WebProbeCacheEntry]> = [];
           let visibleUrl: string | null = null;
           for (const url of group.urls) {
             const key = webProbeCacheKey(url);
-            const { probe, fresh } = yield* getProbe(url, group.server.pid);
-            probes.push([key, probe, fresh]);
+            const probe = yield* getProbe(url, group.server.pid);
+            probes.push([key, probe]);
             if (probe.isWeb) {
               visibleUrl = url;
               break;
@@ -603,16 +624,27 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       { concurrency: WEB_PROBE_CONCURRENCY },
     );
     const completedAtMillis = yield* Clock.currentTimeMillis;
-    const nextCache = new Map(
-      [...cached].filter(([, probe]) => probe.expiresAtMillis > completedAtMillis),
-    );
+    // Only current Windows candidates may keep a readiness retry scheduled.
+    const nextCache =
+      hostPlatform === "win32"
+        ? new Map<string, WebProbeCacheEntry>()
+        : new Map([...cached].filter(([, probe]) => probe.expiresAtMillis > completedAtMillis));
     const discovered: DiscoveredLocalServer[] = [];
     const configured = new Map<string, DiscoveredLocalServer>();
     for (const { group, probes, visibleUrl } of probed) {
-      for (const [key, probe, fresh] of probes) {
+      for (const [key, probe] of probes) {
         nextCache.set(
           key,
-          fresh ? { ...probe, expiresAtMillis: completedAtMillis + WEB_PROBE_CACHE_TTL_MS } : probe,
+          cached.get(key) === probe
+            ? probe
+            : {
+                ...probe,
+                expiresAtMillis:
+                  completedAtMillis +
+                  (probe.retryUntilMillis > completedAtMillis
+                    ? Math.min(probe.retryDelayMillis, probe.retryUntilMillis - completedAtMillis)
+                    : WEB_PROBE_CACHE_TTL_MS),
+              },
         );
       }
       if (visibleUrl === null) continue;
@@ -693,6 +725,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       }
     }
     if (terminalByProcessId.size === 0 && configuredUrls.length === 0) {
+      if (hostPlatform === "win32") yield* Ref.set(webProbeCacheRef, new Map());
       return { discovered: [], configured: new Map() } satisfies WebProbeSnapshot;
     }
     if (hostPlatform === "win32") {
@@ -762,9 +795,23 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       scanSemaphore.withPermits(1)(scanUnlocked(configuredUrls)),
   );
 
+  const wakeWindowsDiscovery = Effect.gen(function* () {
+    if (hostPlatform === "win32" && (yield* Ref.get(stateRef)).retainCount > 0) {
+      yield* Queue.offer(windowsWake, undefined);
+    }
+  });
+
+  const watchWindowsStartup = Effect.gen(function* () {
+    if (hostPlatform !== "win32") return;
+    const nowMillis = yield* Clock.currentTimeMillis;
+    yield* Ref.set(windowsStartupUntilRef, nowMillis + WINDOWS_STARTUP_WINDOW_MS);
+    yield* wakeWindowsDiscovery;
+  });
+
   const scanOnce: PortDiscovery["Service"]["scan"] = (configuredUrls = []) => {
     const normalized = normalizeConfiguredUrls(configuredUrls);
     return scanSnapshot(normalized).pipe(
+      Effect.tap(() => wakeWindowsDiscovery),
       Effect.map((snapshot) => projectWebProbeSnapshot(snapshot, normalized)),
     );
   };
@@ -802,7 +849,28 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
   const pollIfRetained = Ref.get(stateRef).pipe(
     Effect.flatMap((state) => (state.retainCount > 0 ? pollTick() : Effect.void)),
   );
-  yield* Effect.forkScoped(pollIfRetained.pipe(Effect.repeat(Schedule.spaced(POLL_INTERVAL))));
+  // A single wake slot coalesces process changes; scans never block terminal bookkeeping.
+  const waitForNextScan = Effect.gen(function* () {
+    if (hostPlatform !== "win32") return yield* Effect.sleep(POLL_INTERVAL);
+    const state = yield* Ref.get(stateRef);
+    if (state.retainCount === 0) {
+      yield* Queue.take(windowsWake);
+    } else {
+      const nowMillis = yield* Clock.currentTimeMillis;
+      const startupUntilMillis = yield* Ref.get(windowsStartupUntilRef);
+      let delayMillis =
+        startupUntilMillis > nowMillis
+          ? Math.min(WINDOWS_STARTUP_INTERVAL_MS, startupUntilMillis - nowMillis)
+          : Duration.toMillis(POLL_INTERVAL);
+      for (const probe of (yield* Ref.get(webProbeCacheRef)).values()) {
+        if (!probe.isWeb && probe.expiresAtMillis <= probe.retryUntilMillis) {
+          delayMillis = Math.min(delayMillis, Math.max(1, probe.expiresAtMillis - nowMillis));
+        }
+      }
+      yield* Queue.take(windowsWake).pipe(Effect.timeoutOption(Duration.millis(delayMillis)));
+    }
+  });
+  yield* Effect.forkScoped(pollIfRetained.pipe(Effect.andThen(waitForNextScan), Effect.forever));
 
   const acquireRetention = Effect.fn("PortDiscovery.retain")(function* () {
     const wasIdle = yield* Ref.modify(stateRef, (state) => [
@@ -811,6 +879,7 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     ]);
     if (wasIdle) {
       yield* pollTick();
+      yield* watchWindowsStartup;
     }
   });
 
@@ -818,7 +887,9 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
     Ref.update(stateRef, (state) => ({
       ...state,
       retainCount: Math.max(0, state.retainCount - 1),
-    })),
+    })).pipe(
+      Effect.andThen(hostPlatform === "win32" ? Queue.offer(windowsWake, undefined) : Effect.void),
+    ),
   );
 
   const subscribe: PortDiscovery["Service"]["subscribe"] = Effect.fn("PortDiscovery.subscribe")(
@@ -850,27 +921,31 @@ export const make = Effect.gen(function* PortDiscoveryMake() {
       const processIds = new Set(
         input.processIds.filter((processId) => Number.isInteger(processId) && processId > 0),
       );
-      yield* Ref.update(stateRef, (state) => {
+      const changed = yield* Ref.modify(stateRef, (state) => {
         const terminalProcesses = new Map(state.terminalProcesses);
         const key = terminalOwnerKey(owner);
+        const previous = terminalProcesses.get(key)?.processIds;
+        if (
+          (previous?.size ?? 0) === processIds.size &&
+          [...processIds].every((pid) => previous?.has(pid))
+        ) {
+          return [false, state];
+        }
         if (processIds.size === 0) {
           terminalProcesses.delete(key);
         } else {
           terminalProcesses.set(key, { owner, processIds });
         }
-        return { ...state, terminalProcesses };
+        return [true, { ...state, terminalProcesses }];
       });
+      if (changed) {
+        yield* processIds.size > 0 ? watchWindowsStartup : wakeWindowsDiscovery;
+      }
     });
 
   const unregisterTerminal: PortDiscovery["Service"]["unregisterTerminal"] = Effect.fn(
     "PortDiscovery.unregisterTerminal",
-  )(function* (input) {
-    yield* Ref.update(stateRef, (state) => {
-      const terminalProcesses = new Map(state.terminalProcesses);
-      terminalProcesses.delete(terminalOwnerKey(input));
-      return { ...state, terminalProcesses };
-    });
-  });
+  )((input) => registerTerminalProcesses({ ...input, processIds: [] }));
 
   return PortDiscovery.of({
     scan: scanOnce,
