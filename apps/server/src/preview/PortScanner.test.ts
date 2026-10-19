@@ -6,7 +6,9 @@ import {
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
+import * as Queue from "effect/Queue";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -63,29 +65,36 @@ const ownedScanner = (processIds: ReadonlyArray<number> = [1234]) =>
     }),
   );
 
-const layerLsofScanner = (input: {
+const layerListenerScanner = (input: {
   readonly pid: () => number;
   readonly fetch: typeof globalThis.fetch;
-  readonly stdout?: () => string;
+  readonly stdout?: Effect.Effect<string>;
+  readonly platform?: NodeJS.Platform;
 }) =>
   PortScanner.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerNoProc,
         Layer.succeed(ProcessRunner.ProcessRunner, {
-          run: () =>
-            Effect.succeed({
-              stdout: input.stdout?.() ?? `p${input.pid()}\ncnode\nn*:${LSOF_TEST_PORT}\n`,
-              stderr: "",
-              code: null,
-              timedOut: false,
-              stdoutTruncated: false,
-              stderrTruncated: false,
-              stdoutInvalidUtf8: false,
-              stderrInvalidUtf8: false,
-            }),
+          run: ({ args }) =>
+            (input.platform === "win32" && !args.includes("tcp")
+              ? Effect.succeed("")
+              : (input.stdout ??
+                Effect.sync(() => `p${input.pid()}\ncnode\nn*:${LSOF_TEST_PORT}\n`))
+            ).pipe(
+              Effect.map((stdout) => ({
+                stdout,
+                stderr: "",
+                code: null,
+                timedOut: false,
+                stdoutTruncated: false,
+                stderrTruncated: false,
+                stdoutInvalidUtf8: false,
+                stderrInvalidUtf8: false,
+              })),
+            ),
         }),
-        Layer.succeed(HostProcess.Platform, "linux"),
+        Layer.succeed(HostProcess.Platform, input.platform ?? "linux"),
         FetchHttpClient.layer.pipe(
           Layer.provide(Layer.succeed(FetchHttpClient.Fetch, input.fetch)),
         ),
@@ -108,7 +117,7 @@ effectIt.effect("keeps a full configured URL when the discovered server root fai
           }),
     );
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+  const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
 
   return Effect.gen(function* () {
     const scanner = yield* PortScanner.PortDiscovery;
@@ -174,7 +183,7 @@ effectIt.effect("projects configured paths independently for simultaneous subscr
         : new Response("not found", { status: 404 }),
     );
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+  const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
 
   return Effect.gen(function* () {
     const scanner = yield* PortScanner.PortDiscovery;
@@ -207,7 +216,7 @@ effectIt.effect(
           ? new Response("app", { headers: { "content-type": "text/html" } })
           : new Response("not found", { status: 404 }),
       )) as typeof globalThis.fetch;
-    const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+    const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
 
     return Effect.gen(function* () {
       const scanner = yield* PortScanner.PortDiscovery;
@@ -240,7 +249,7 @@ effectIt.effect("stops probing a subscriber's configured paths after its scope c
         : new Response("not found", { status: 404 }),
     );
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+  const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
 
   return Effect.gen(function* () {
     const scanner = yield* PortScanner.PortDiscovery;
@@ -268,7 +277,7 @@ effectIt.effect("uses the current configured fragment when readiness comes from 
     requests.push(String(input));
     return Promise.resolve(new Response("docs", { headers: { "content-type": "text/html" } }));
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+  const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
   const oldUrl = `http://localhost:${LSOF_TEST_PORT}/docs#old`;
   const newUrl = `http://localhost:${LSOF_TEST_PORT}/docs#new`;
 
@@ -291,7 +300,7 @@ effectIt.effect("falls back to HTTPS and does not follow redirects while probing
     if (String(input).startsWith("http:")) throw new TypeError("TLS listener");
     return new Response(null, { status: 302, headers: { location: "https://example.com" } });
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn });
+  const layer = layerListenerScanner({ pid: () => 1234, fetch: fetchFn });
 
   return Effect.gen(function* () {
     const scanner = yield* ownedScanner();
@@ -311,7 +320,11 @@ effectIt.effect("probes a port only while T3 terminals own every listener on it"
     requests.push(String(input));
     return Promise.resolve(new Response("app", { headers: { "content-type": "text/html" } }));
   }) as typeof globalThis.fetch;
-  const layer = layerLsofScanner({ pid: () => 1234, fetch: fetchFn, stdout: () => stdout });
+  const layer = layerListenerScanner({
+    pid: () => 1234,
+    fetch: fetchFn,
+    stdout: Effect.sync(() => stdout),
+  });
 
   return Effect.gen(function* () {
     const scanner = yield* ownedScanner();
@@ -341,7 +354,7 @@ effectIt.effect(
       new Response("not found", { status: 404, headers: { "content-type": "text/html" } });
     const fetchFn = ((_input: Parameters<typeof globalThis.fetch>[0]) =>
       Promise.resolve(makeResponse())) as typeof globalThis.fetch;
-    const layer = layerLsofScanner({ pid: () => pid, fetch: fetchFn });
+    const layer = layerListenerScanner({ pid: () => pid, fetch: fetchFn });
 
     return Effect.gen(function* () {
       const scanner = yield* ownedScanner([1, 2, 3, 4, 5, 6, 7]);
@@ -496,3 +509,145 @@ effectIt.effect("ignores a partial Windows netstat snapshot when one query exits
     expect(yield* scanner.scan()).toEqual([]);
   }).pipe(Effect.provide(layer));
 });
+
+const windowsListener = (pid: number) =>
+  `  TCP  127.0.0.1:${LSOF_TEST_PORT}  0.0.0.0:0  LISTENING  ${pid}`;
+
+const htmlResponse = () =>
+  Promise.resolve(new Response("app", { headers: { "content-type": "text/html" } }));
+const watchOwnedScanner = Effect.gen(function* () {
+  const scanner = yield* ownedScanner();
+  const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
+  yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
+    Queue.offer(received, servers).pipe(Effect.asVoid),
+  );
+  yield* scanner.retain;
+  yield* TestClock.adjust("0 millis");
+  return { scanner, received };
+});
+
+effectIt.effect(
+  "Windows coalesces PID changes, skips equivalent sets, and stops after release",
+  () =>
+    Effect.gen(function* () {
+      const probing = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let scans = 0;
+      let listening = false;
+      const layer = layerListenerScanner({
+        platform: "win32",
+        pid: () => 5678,
+        stdout: Effect.gen(function* () {
+          scans += 1;
+          if (!listening) return "";
+          yield* Deferred.succeed(probing, undefined);
+          yield* Deferred.await(release);
+          return windowsListener(5678);
+        }),
+        fetch: htmlResponse,
+      });
+      yield* Effect.gen(function* () {
+        const retainedScope = yield* Scope.make();
+        const { scanner, received } = yield* watchOwnedScanner.pipe(
+          Effect.provideService(Scope.Scope, retainedScope),
+        );
+        const before = scans;
+        listening = true;
+        for (const pid of [5678, 6789, 7890]) {
+          yield* ownedScanner([1234, 5678, pid]);
+          if (pid === 5678) yield* Deferred.await(probing);
+        }
+        expect(scans).toBe(before + 1);
+        yield* Deferred.succeed(release, undefined);
+        expect((yield* Queue.take(received))[0]?.pid).toBe(5678);
+        yield* TestClock.adjust("0 millis");
+        expect(scans).toBe(before + 2);
+        yield* ownedScanner([7890, 5678, 1234, 5678, -1, 0]);
+        yield* TestClock.adjust("0 millis");
+        expect(scans).toBe(before + 2);
+        yield* scanner.unregisterTerminal({
+          threadId: "scanner-thread",
+          terminalId: "scanner-terminal",
+        });
+        expect(yield* Queue.take(received)).toEqual([]);
+        yield* ownedScanner([5678]);
+        expect((yield* Queue.take(received))[0]?.pid).toBe(5678);
+        yield* Scope.close(retainedScope, Exit.void);
+        const stopped = scans;
+        yield* TestClock.adjust("1 minute");
+        expect(scans).toBe(stopped);
+      }).pipe(Effect.provide(layer));
+    }),
+);
+
+effectIt.effect.each([
+  { phase: "startup", elapsed: "0 millis", interval: "1 second" },
+  { phase: "fallback", elapsed: "10 seconds", interval: "3 seconds" },
+] as const)(
+  "Windows $phase checks find a silent listener after PID registration",
+  ({ elapsed, interval }) => {
+    let listening = false;
+    const layer = layerListenerScanner({
+      platform: "win32",
+      pid: () => 1234,
+      stdout: Effect.sync(() => (listening ? windowsListener(1234) : "")),
+      fetch: htmlResponse,
+    });
+    return Effect.gen(function* () {
+      const { received } = yield* watchOwnedScanner;
+      yield* TestClock.adjust(elapsed);
+      listening = true;
+      yield* TestClock.adjust(interval);
+      expect((yield* Queue.take(received))[0]?.port).toBe(LSOF_TEST_PORT);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+effectIt.effect.each([
+  { phase: "initial retry", checkpoints: [], delay: "250 millis", requests: 3 },
+  {
+    phase: "bounded backoff",
+    checkpoints: [
+      ["10 seconds", 18],
+      ["14 seconds", 18],
+      ["1 second", 20],
+      ["14 seconds", 20],
+    ],
+    delay: "3 seconds",
+    requests: 21,
+  },
+] as const)(
+  "Windows readiness publishes after $phase and removes vanished listeners",
+  ({ checkpoints, delay, requests: expectedRequests }) => {
+    let ready = false;
+    let listening = true;
+    let requests = 0;
+    const layer = layerListenerScanner({
+      platform: "win32",
+      pid: () => 1234,
+      stdout: Effect.sync(() => (listening ? windowsListener(1234) : "")),
+      fetch: () => {
+        requests += 1;
+        return ready ? htmlResponse() : Promise.resolve(new Response(null, { status: 503 }));
+      },
+    });
+    return Effect.gen(function* () {
+      const { received } = yield* watchOwnedScanner;
+      expect(requests).toBe(2);
+      for (const [delay, count] of checkpoints) {
+        yield* TestClock.adjust(delay);
+        expect(requests).toBe(count);
+      }
+      ready = true;
+      yield* TestClock.adjust(delay);
+      expect((yield* Queue.take(received))[0]?.port).toBe(LSOF_TEST_PORT);
+      yield* TestClock.adjust("10 seconds");
+      expect(requests).toBe(expectedRequests);
+      listening = false;
+      yield* TestClock.adjust("3 seconds");
+      expect(yield* Queue.take(received)).toEqual([]);
+      yield* TestClock.adjust("30 seconds");
+      expect(requests).toBe(expectedRequests);
+    }).pipe(Effect.provide(layer));
+  },
+);
