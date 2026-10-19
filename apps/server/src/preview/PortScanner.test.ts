@@ -134,6 +134,7 @@ const layerLsofScanner = (input: {
 const layerWindowsScanner = (input: {
   readonly listeners: WindowsTcpListeners.WindowsTcpListeners["Service"]["scan"];
   readonly fetch: typeof globalThis.fetch;
+  readonly processName?: WindowsTcpListeners.WindowsTcpListeners["Service"]["processName"];
 }) =>
   Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
     Layer.provide(
@@ -145,7 +146,7 @@ const layerWindowsScanner = (input: {
         Layer.succeed(HostProcess.Platform, "win32"),
         Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
           scan: input.listeners,
-          processName: () => Effect.succeed("node"),
+          processName: input.processName ?? (() => Effect.succeed("node")),
         }),
         FetchHttpClient.layer.pipe(
           Layer.provide(Layer.succeed(FetchHttpClient.Fetch, input.fetch)),
@@ -156,6 +157,17 @@ const layerWindowsScanner = (input: {
 
 const htmlResponse = () =>
   Promise.resolve(new Response("app", { headers: { "content-type": "text/html" } }));
+
+const watchOwnedScanner = Effect.gen(function* () {
+  const scanner = yield* ownedScanner();
+  const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
+  yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
+    Queue.offer(received, servers).pipe(Effect.asVoid),
+  );
+  yield* scanner.retain;
+  yield* TestClock.adjust("0 millis");
+  return { scanner, received };
+});
 
 const openServer = (
   port: number,
@@ -1024,119 +1036,53 @@ effectIt.effect("ignores a partial Windows netstat snapshot when one query exits
 });
 
 effectIt.effect(
-  "native Windows rows preserve shared-port ownership and names without commands",
+  "native Windows discovery preserves ownership through process-name failure and caching",
   () => {
     let scans = 0;
     let nameLookups = 0;
-    const fetchFn: typeof globalThis.fetch = () =>
-      Promise.resolve(new Response("hello", { headers: { "content-type": "text/html" } }));
-    const layer = Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          layerNoProc,
-          Layer.succeed(ProcessRunner.ProcessRunner, {
-            run: () => Effect.die(new Error("Native discovery must not spawn commands")),
-          }),
-          Layer.succeed(HostProcess.Platform, "win32"),
-          Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
-            scan: Effect.sync(() => {
-              scans += 1;
-              return [
-                { port: 5173, pid: 1234 },
-                { port: 5173, pid: 9999 },
-                { port: 43123, pid: 1234 },
-                { port: 43123, pid: 1234 },
-              ];
-            }),
-            processName: () =>
-              Effect.sync(() => {
-                nameLookups += 1;
-                return "node";
-              }),
-          }),
-          FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchFn))),
+    const layer = layerWindowsScanner({
+      listeners: Effect.sync(() => {
+        scans += 1;
+        return [
+          { port: 5173, pid: 1234 },
+          { port: 5173, pid: 9999 },
+          { port: LSOF_TEST_PORT, pid: 1234 },
+          { port: LSOF_TEST_PORT, pid: 1234 },
+        ];
+      }),
+      processName: () =>
+        Effect.suspend(() =>
+          ++nameLookups === 1
+            ? Effect.fail(
+                new WindowsTcpListeners.WindowsTcpProbeError({
+                  operation: "process-name",
+                  cause: new Error("Process exited during lookup"),
+                }),
+              )
+            : Effect.succeed("node"),
         ),
-      ),
-    );
+      fetch: htmlResponse,
+    });
     return Effect.gen(function* () {
       const scanner = yield* PortScanner.PortDiscovery;
       expect(yield* scanner.scan()).toEqual([]);
       expect(scans).toBe(0);
-      yield* scanner.registerTerminalProcesses({
-        threadId: "scanner-thread",
-        terminalId: "scanner-terminal",
-        processIds: [1234],
-      });
-      const discovered = yield* scanner.scan();
-      expect(
-        discovered.map(({ port, pid, processName, terminal }) => ({
-          port,
-          pid,
-          processName,
-          terminal,
-        })),
-      ).toEqual([
+      yield* ownedScanner();
+      expect(yield* scanner.scan()).toMatchObject([
         {
-          port: 43123,
+          port: LSOF_TEST_PORT,
           pid: 1234,
-          processName: "node",
+          processName: null,
           terminal: { threadId: "scanner-thread", terminalId: "scanner-terminal" },
         },
       ]);
       const configured = yield* scanner.scan(["http://localhost:5173"]);
       expect(configured.find((server) => server.port === 5173)?.terminal).toBeNull();
-      expect(nameLookups).toBe(1);
+      expect((yield* scanner.scan())[0]?.processName).toBe("node");
+      expect(nameLookups).toBe(2);
       yield* TestClock.adjust(Duration.seconds(61));
       yield* scanner.scan();
-      expect(nameLookups).toBe(2);
-    }).pipe(Effect.provide(layer));
-  },
-);
-
-effectIt.effect(
-  "native process-name errors keep listener ownership and retry on the next scan",
-  () => {
-    let attempts = 0;
-    const layer = Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          layerNoProc,
-          Layer.succeed(ProcessRunner.ProcessRunner, {
-            run: () => Effect.die(new Error("Native discovery must not spawn commands")),
-          }),
-          Layer.succeed(HostProcess.Platform, "win32"),
-          Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
-            scan: Effect.succeed([{ port: 43123, pid: 1234 }]),
-            processName: () =>
-              Effect.suspend(() =>
-                ++attempts === 1
-                  ? Effect.fail(
-                      new WindowsTcpListeners.WindowsTcpProbeError({
-                        operation: "process-name",
-                        cause: new Error("Process exited during lookup"),
-                      }),
-                    )
-                  : Effect.succeed("node"),
-              ),
-          }),
-          FetchHttpClient.layer.pipe(
-            Layer.provide(
-              Layer.succeed(FetchHttpClient.Fetch, () =>
-                Promise.resolve(
-                  new Response("hello", { headers: { "content-type": "text/html" } }),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-    return Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      const first = yield* scanner.scan();
-      expect(first[0]?.processName).toBeNull();
-      expect(first[0]?.terminal?.threadId).toBe("scanner-thread");
-      expect((yield* scanner.scan())[0]?.processName).toBe("node");
+      expect(nameLookups).toBe(3);
     }).pipe(Effect.provide(layer));
   },
 );
@@ -1153,13 +1099,7 @@ effectIt.effect(
       fetch: htmlResponse,
     });
     return Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
-      yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
-        Queue.offer(received, servers).pipe(Effect.asVoid),
-      );
-      yield* scanner.retain;
-      yield* TestClock.adjust("0 millis");
+      const { scanner, received } = yield* watchOwnedScanner;
       yield* scanner.registerTerminalProcesses({
         threadId: "scanner-thread",
         terminalId: "scanner-terminal",
@@ -1185,48 +1125,26 @@ effectIt.effect(
   },
 );
 
-effectIt.effect(
-  "Windows startup checks find a listener opened after its PID was registered",
-  () => {
+effectIt.effect.each([
+  { phase: "startup", elapsed: "0 millis", interval: "1 second" },
+  { phase: "fallback", elapsed: "10 seconds", interval: "3 seconds" },
+] as const)(
+  "Windows $phase checks find a silent listener after PID registration",
+  ({ elapsed, interval }) => {
     let listening = false;
     const layer = layerWindowsScanner({
       listeners: Effect.sync(() => (listening ? [{ port: LSOF_TEST_PORT, pid: 1234 }] : [])),
       fetch: htmlResponse,
     });
     return Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
-      yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
-        Queue.offer(received, servers).pipe(Effect.asVoid),
-      );
-      yield* scanner.retain;
-      yield* TestClock.adjust("0 millis");
+      const { received } = yield* watchOwnedScanner;
+      yield* TestClock.adjust(elapsed);
       listening = true;
-      yield* TestClock.adjust("1 second");
+      yield* TestClock.adjust(interval);
       expect((yield* Queue.take(received)).map((server) => server.port)).toEqual([LSOF_TEST_PORT]);
     }).pipe(Effect.provide(layer));
   },
 );
-
-effectIt.effect("Windows fallback finds a silent new port in an existing process", () => {
-  let listening = false;
-  const layer = layerWindowsScanner({
-    listeners: Effect.sync(() => (listening ? [{ port: LSOF_TEST_PORT, pid: 1234 }] : [])),
-    fetch: htmlResponse,
-  });
-  return Effect.gen(function* () {
-    const scanner = yield* ownedScanner();
-    const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
-    yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
-      Queue.offer(received, servers).pipe(Effect.asVoid),
-    );
-    yield* scanner.retain;
-    yield* TestClock.adjust("10 seconds");
-    listening = true;
-    yield* TestClock.adjust("3 seconds");
-    expect((yield* Queue.take(received)).map((server) => server.port)).toEqual([LSOF_TEST_PORT]);
-  }).pipe(Effect.provide(layer));
-});
 
 effectIt.effect(
   "Windows retries an unready listener and publishes HTML without the negative TTL",
@@ -1241,13 +1159,7 @@ effectIt.effect(
       },
     });
     return Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
-      yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
-        Queue.offer(received, servers).pipe(Effect.asVoid),
-      );
-      yield* scanner.retain;
-      yield* TestClock.adjust("0 millis");
+      const { received } = yield* watchOwnedScanner;
       expect(requests).toBe(2);
       ready = true;
       yield* TestClock.adjust("250 millis");
@@ -1258,34 +1170,6 @@ effectIt.effect(
     }).pipe(Effect.provide(layer));
   },
 );
-
-effectIt.effect("Windows readiness retries stop after a bounded startup window", () => {
-  let ready = false;
-  let requests = 0;
-  const layer = layerWindowsScanner({
-    listeners: Effect.succeed([{ port: LSOF_TEST_PORT, pid: 1234 }]),
-    fetch: () => {
-      requests += 1;
-      return ready ? htmlResponse() : Promise.resolve(new Response(null, { status: 503 }));
-    },
-  });
-  return Effect.gen(function* () {
-    const scanner = yield* ownedScanner();
-    expect(yield* scanner.scan()).toEqual([]);
-    for (const delay of [250, 500, 1_000, 2_000, 2_000, 2_000, 2_000, 250]) {
-      yield* TestClock.adjust(Duration.millis(delay));
-      expect(yield* scanner.scan()).toEqual([]);
-    }
-    expect(requests).toBe(18);
-    ready = true;
-    yield* TestClock.adjust("14 seconds");
-    expect(yield* scanner.scan()).toEqual([]);
-    expect(requests).toBe(18);
-    yield* TestClock.adjust("1 second");
-    expect(yield* scanner.scan()).toHaveLength(1);
-    expect(requests).toBe(19);
-  }).pipe(Effect.provide(layer));
-});
 
 effectIt.effect("Windows discovery releases its timer work with the last retainer", () => {
   let scans = 0;
@@ -1314,19 +1198,19 @@ effectIt.effect("Windows discovery releases its timer work with the last retaine
 });
 
 effectIt.effect(
-  "Windows background readiness retries back off for a permanent non-web listener",
+  "Windows bounds readiness retries and resumes probing after the negative cache expires",
   () => {
+    let ready = false;
     let requests = 0;
     const layer = layerWindowsScanner({
       listeners: Effect.succeed([{ port: LSOF_TEST_PORT, pid: 1234 }]),
       fetch: () => {
         requests += 1;
-        return Promise.resolve(new Response(null, { status: 503 }));
+        return ready ? htmlResponse() : Promise.resolve(new Response(null, { status: 503 }));
       },
     });
     return Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      yield* scanner.retain;
+      const { received } = yield* watchOwnedScanner;
       yield* TestClock.adjust("10 seconds");
       expect(requests).toBe(18);
       yield* TestClock.adjust("14 seconds");
@@ -1335,6 +1219,10 @@ effectIt.effect(
       expect(requests).toBe(20);
       yield* TestClock.adjust("14 seconds");
       expect(requests).toBe(20);
+      ready = true;
+      yield* TestClock.adjust("3 seconds");
+      expect((yield* Queue.take(received))[0]?.port).toBe(LSOF_TEST_PORT);
+      expect(requests).toBe(21);
     }).pipe(Effect.provide(layer));
   },
 );
@@ -1377,13 +1265,7 @@ effectIt.effect("Windows process changes coalesce while a probe is in flight", (
       fetch: htmlResponse,
     });
     yield* Effect.gen(function* () {
-      const scanner = yield* ownedScanner();
-      const received = yield* Queue.unbounded<ReadonlyArray<DiscoveredLocalServer>>();
-      yield* scanner.subscribe({ configuredUrls: [], initialSnapshot: [] }, (servers) =>
-        Queue.offer(received, servers).pipe(Effect.asVoid),
-      );
-      yield* scanner.retain;
-      yield* TestClock.adjust("0 millis");
+      const { scanner, received } = yield* watchOwnedScanner;
       const before = scans;
       listening = true;
       for (const pid of [5678, 6789, 7890]) {
