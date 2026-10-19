@@ -19,6 +19,22 @@ import { FetchHttpClient } from "effect/http";
 
 import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "./PortScanner.ts";
+import * as WindowsTcpListeners from "./WindowsTcpListeners.ts";
+
+const layerCommandPortScanner = Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
+  Layer.provide(
+    Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
+      scan: Effect.fail(
+        new WindowsTcpListeners.WindowsTcpProbeError({
+          operation: "load",
+          cause: new Error("Native API unavailable"),
+        }),
+      ),
+      processName: () => Effect.succeed(null),
+    }),
+  ),
+);
+
 const processProbeFailure: ProcessRunner.ProcessRunner["Service"]["run"] = (input) =>
   Effect.fail(
     new ProcessRunner.ProcessSpawnError({
@@ -459,7 +475,7 @@ effectIt.effect("ignores a partial Windows netstat snapshot when one query exits
     Promise.resolve(
       new Response("hello", { headers: { "content-type": "text/html" } }),
     )) as typeof globalThis.fetch;
-  const layer = PortScanner.layer.pipe(
+  const layer = layerCommandPortScanner.pipe(
     Layer.provide(
       Layer.mergeAll(
         layerNoProc,
@@ -496,3 +512,53 @@ effectIt.effect("ignores a partial Windows netstat snapshot when one query exits
     expect(yield* scanner.scan()).toEqual([]);
   }).pipe(Effect.provide(layer));
 });
+
+effectIt.effect(
+  "filters native Windows ownership before HTTP probes and caches process names",
+  () => {
+    const requests: string[] = [];
+    const nameLookups: number[] = [];
+    const layer = Layer.effect(PortScanner.PortDiscovery, PortScanner.make).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          layerNoProc,
+          Layer.succeed(HostProcess.Platform, "win32"),
+          Layer.succeed(ProcessRunner.ProcessRunner, { run: processProbeFailure }),
+          Layer.succeed(WindowsTcpListeners.WindowsTcpListeners, {
+            scan: Effect.succeed([
+              { port: 5173, pid: 1234 },
+              { port: 5173, pid: 1234 },
+              { port: 5174, pid: 1234 },
+              { port: 5174, pid: 9999 },
+              { port: 5175, pid: 9999 },
+            ]),
+            processName: (pid) =>
+              Effect.sync(() => {
+                nameLookups.push(pid);
+                return "node";
+              }),
+          }),
+          FetchHttpClient.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FetchHttpClient.Fetch, (input) => {
+                requests.push(String(input));
+                return Promise.resolve(
+                  new Response("app", { headers: { "content-type": "text/html" } }),
+                );
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    return Effect.gen(function* () {
+      const scanner = yield* ownedScanner();
+      const servers = yield* scanner.scan();
+      expect(servers).toMatchObject([{ port: 5173, pid: 1234, processName: "node" }]);
+      expect(servers).toHaveLength(1);
+      expect(yield* scanner.scan()).toEqual(servers);
+      expect(requests).toEqual(["http://localhost:5173/"]);
+      expect(nameLookups).toEqual([1234]);
+    }).pipe(Effect.provide(layer));
+  },
+);
